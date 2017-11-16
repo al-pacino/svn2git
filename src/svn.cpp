@@ -572,11 +572,10 @@ int SvnRevision::fetchRevProps()
     authorident = svnauthor ? identities.value(svnauthor->data) : QByteArray();
     epoch = svndate ? get_epoch(svndate->data) : 0;
     if (authorident.isEmpty()) {
-        if (!svnauthor || svn_string_isempty(svnauthor))
-            authorident = "nobody <nobody@localhost>";
-        else
-            authorident = svnauthor->data + QByteArray(" <") + svnauthor->data +
-                QByteArray("@") + userdomain.toUtf8() + QByteArray(">");
+        authorident = "unknown <unknown@unknown>";
+        if( svnauthor && !svn_string_isempty( svnauthor ) ) {
+            printf( "author '%s' was not found in identity map.\n", svnauthor->data );
+        }
     }
     propsFetched = true;
     return EXIT_SUCCESS;
