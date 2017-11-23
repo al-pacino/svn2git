@@ -267,7 +267,7 @@ static QString marksFileName(QString name)
 
 FastImportRepository::FastImportRepository(const Rules::Repository &rule)
     : name(rule.name), prefix(rule.forwardTo), fastImport(name), commitCount(0), outstandingTransactions(0),
-      last_commit_mark(0), next_file_mark(maxMark), processHasStarted(false)
+      last_commit_mark(1), next_file_mark(maxMark), processHasStarted(false)
 {
     foreach (Rules::Repository::Branch branchRule, rule.branches) {
         Branch branch;
@@ -774,7 +774,7 @@ void FastImportRepository::startFastImport()
         QStringList marksOptions;
         marksOptions << "--import-marks=" + marksFile;
         marksOptions << "--export-marks=" + marksFile;
-        marksOptions << "--force";
+        //marksOptions << "--force";
 
         fastImport.setStandardOutputFile(logFileName(name), QIODevice::Append);
         fastImport.setProcessChannelMode(QProcess::MergedChannels);
@@ -992,6 +992,7 @@ void FastImportRepository::Transaction::commit()
     s.append("committer " + author + " " + QString::number(datetime).toUtf8() + " +0000" + "\n");
     s.append("data " + QString::number(message.length()) + "\n");
     s.append(message + "\n");
+    s.append("from :" + QByteArray::number(mark - 1) + "\n");
     repository->fastImport.write(s);
 
     // note some of the inferred merges
