@@ -51,10 +51,165 @@
 
 #include "repository.h"
 
-#include <enca.h>
 #include <iconv.h>
 #include <string>
 #include <unordered_map>
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+enum Encoding {
+    E_BINARY,
+    E_ASCII,
+    E_UTF8,
+    E_UTF8BOM,
+    E_UTF16_LE,
+    E_UTF16_BE,
+    E_UTF32_LE,
+    E_UTF32_BE,
+    E_UTF16_LEBOM,
+    E_UTF16_BEBOM 
+};
+
+Encoding DetectEncoding(const char* const pBuffer, const int cb)
+{
+    if (cb < 2)
+        return E_ASCII;
+    const uint32_t * const pVal32 = (uint32_t *)pBuffer;
+    const uint16_t * const pVal16 = (uint16_t *)pBuffer;
+    const uint8_t * const pVal8 = (uint8_t *)pBuffer;
+    // scan the whole buffer for a 0x00000000 sequence
+    // if found, we assume a binary file
+    int nDwords = cb/4;
+    for (int j=0; j<nDwords; ++j)
+    {
+        if (0x00000000 == pVal32[j])
+            return E_BINARY;
+    }
+    if (cb >=4 )
+    {
+        if (*pVal32 == 0x0000FEFF)
+        {
+            return E_UTF32_LE;
+        }
+        if (*pVal32 == 0xFFFE0000)
+        {
+            return E_UTF32_BE;
+        }
+    }
+    if (*pVal16 == 0xFEFF)
+    {
+        return E_UTF16_LEBOM;
+    }
+    if (*pVal16 == 0xFFFE)
+    {
+        return E_UTF16_BEBOM;
+    }
+    if (cb < 3)
+        return E_ASCII;
+    if (*pVal16 == 0xBBEF)
+    {
+        if (pVal8[2] == 0xBF)
+            return E_UTF8BOM;
+    }
+    // check for illegal UTF8 sequences
+    bool bNonANSI = false;
+    int nNeedData = 0;
+    int i=0;
+    int nullcount = 0;
+    for (; i < cb; ++i)
+    {
+        if (pVal8[i] == 0)
+        {
+            ++nullcount;
+            // count the null chars, we do not want to treat an ASCII/UTF8 file
+            // as UTF16 just because of some null chars that might be accidentally
+            // in the file.
+            // Use an arbitrary value of one fiftieth of the file length as
+            // the limit after which a file is considered UTF16.
+            if (nullcount > (cb / 50))
+            {
+                // null-chars are not allowed for ASCII or UTF8, that means
+                // this file is most likely UTF16 encoded
+                if (i % 2)
+                    return E_UTF16_LE;
+                else
+                    return E_UTF16_BE;
+            }
+        }
+        if ((pVal8[i] & 0x80) != 0) // non ASCII
+        {
+            bNonANSI = true;
+            break;
+        }
+    }
+    // check remaining text for UTF-8 validity
+    for (; i<cb; ++i)
+    {
+        uint8_t zChar = pVal8[i];
+        if ((zChar & 0x80)==0) // Ascii
+        {
+            if (zChar == 0)
+            {
+                ++nullcount;
+                // count the null chars, we do not want to treat an ASCII/UTF8 file
+                // as UTF16 just because of some null chars that might be accidentally
+                // in the file.
+                // Use an arbitrary value of one fiftieth of the file length as
+                // the limit after which a file is considered UTF16.
+                if (nullcount > (cb / 50))
+                {
+                    // null-chars are not allowed for ASCII or UTF8, that means
+                    // this file is most likely UTF16 encoded
+                    if (i%2)
+                        return E_UTF16_LE;
+                    else
+                        return E_UTF16_BE;
+                }
+                nNeedData = 0;
+            }
+            else if (nNeedData)
+            {
+                return E_ASCII;
+            }
+            continue;
+        }
+        if ((zChar & 0x40)==0) // top bit
+        {
+            if (!nNeedData)
+                return E_ASCII;
+            --nNeedData;
+        }
+        else if (nNeedData)
+        {
+            return E_ASCII;
+        }
+        else if ((zChar & 0x20)==0) // top two bits
+        {
+            if (zChar<=0xC1)
+                return E_ASCII;
+            nNeedData = 1;
+        }
+        else if ((zChar & 0x10)==0) // top three bits
+        {
+            nNeedData = 2;
+        }
+        else if ((zChar & 0x08)==0) // top four bits
+        {
+            if (zChar>=0xf5)
+                return E_ASCII;
+            nNeedData = 3;
+        }
+        else
+            return E_ASCII;
+    }
+    if (bNonANSI && nNeedData==0)
+        // if get here thru nonAscii and no missing data left then its valid UTF8
+        return E_UTF8;
+
+    return E_ASCII;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 using std::unordered_map;
 using std::string;
@@ -72,47 +227,46 @@ using std::make_pair;
 namespace {
 
 class CEnCo {
-	CEnCo( CEnCo&& ) = delete;
-	CEnCo( const CEnCo& ) = delete;
+    CEnCo( CEnCo&& ) = delete;
+    CEnCo( const CEnCo& ) = delete;
 
 public:
     static const size_t Chunk = 8 * 1024;
 
-	static CEnCo& Instance()
-	{
-		if( instance == nullptr ) {
-			instance = new CEnCo();
-		}
-		return *instance;
-	}
+    static CEnCo& Instance()
+    {
+        if( instance == nullptr ) {
+            instance = new CEnCo();
+        }
+        return *instance;
+    }
 
     static svn_error_t* DeviceWrite( void* baton, const char* data, apr_size_t* len );
 
-	void BeginWrite();
-	void WritePart( const char* const data, const size_t length );
+    void BeginWrite();
+    void WritePart( const char* const data, const size_t length );
     void EndWrite( const char*& buffer, size_t& size );
 
 private:
-	static CEnCo* instance;
+    static CEnCo* instance;
 
     static const char Utf8Bom[];
     static const size_t Utf8BomSize;
-	static const size_t InputBufferSize = 32 * 1024 * 1024;
-	static const size_t OutputBufferSize = 64 * 1024 * 1024;
+    static const size_t InputBufferSize = 32 * 1024 * 1024;
+    static const size_t OutputBufferSize = 64 * 1024 * 1024;
 
-	char* inputBuffer;
-	char* outputBuffer;
-	size_t inputOffset;
-	bool isEmpty;
+    char* inputBuffer;
+    char* outputBuffer;
+    size_t inputOffset;
+    bool isEmpty;
 
-	EncaAnalyser encaAnalyzer;
-	unordered_map<string, iconv_t> converters;
+    unordered_map<string, iconv_t> converters;
 
-	CEnCo();
-	~CEnCo();
-	static void check( const bool condition, const char* funcname = "" );
+    CEnCo();
+    ~CEnCo();
+    static void check( const bool condition, const char* funcname = "" );
     static void normalizeLineEndings( char* buffer, size_t& size );
-    static bool isValidUtf8( const char* const buffer, const size_t size );
+    static const char* encodingName( const Encoding encoding );
 };
 
 CEnCo* CEnCo::instance = nullptr;
@@ -120,39 +274,26 @@ const char CEnCo::Utf8Bom[] = { '\xEF', '\xBB', '\xBF' };
 const size_t CEnCo::Utf8BomSize = sizeof( CEnCo::Utf8Bom );
 
 CEnCo::CEnCo() :
-	inputOffset( 0 ),
-	isEmpty( true ),
-	encaAnalyzer( nullptr )
+    inputOffset( 0 ),
+    isEmpty( true )
 {
-	inputBuffer = static_cast<char*>( ::operator new( InputBufferSize * sizeof( char ) ) );
-	check( inputBuffer != nullptr, __FUNCTION__ );
-	outputBuffer = static_cast<char*>( ::operator new( OutputBufferSize * sizeof( char ) ) );
-	check( outputBuffer != nullptr, __FUNCTION__ );
+    inputBuffer = static_cast<char*>( ::operator new( InputBufferSize * sizeof( char ) ) );
+    check( inputBuffer != nullptr, __FUNCTION__ );
+    outputBuffer = static_cast<char*>( ::operator new( OutputBufferSize * sizeof( char ) ) );
+    check( outputBuffer != nullptr, __FUNCTION__ );
 
     // UTF-8 BOM
     memcpy( outputBuffer, Utf8Bom, Utf8BomSize );
-
-	encaAnalyzer = enca_analyser_alloc( "ru" );
-	check( encaAnalyzer != nullptr, __FUNCTION__ );
-    //enca_set_ambiguity( encaAnalyzer, 0 );
-    //enca_set_filtering( encaAnalyzer, 0 );
-    //enca_set_garbage_test( encaAnalyzer, 0 );
-    //enca_set_significant( encaAnalyzer, 5 );
-    //enca_set_threshold( encaAnalyzer, 1.001 );
 }
 
 CEnCo::~CEnCo()
 {
-	::operator delete( inputBuffer );
-	::operator delete( outputBuffer );
+    ::operator delete( inputBuffer );
+    ::operator delete( outputBuffer );
 
-	if( encaAnalyzer != nullptr ) {
-		enca_analyser_free( encaAnalyzer );
-	}
-
-	for( auto converter : converters ) {
-		iconv_close( converter.second );
-	}
+    for( auto converter : converters ) {
+        iconv_close( converter.second );
+    }
 }
 
 svn_error_t* CEnCo::DeviceWrite( void* baton, const char* data, apr_size_t* len )
@@ -165,55 +306,26 @@ svn_error_t* CEnCo::DeviceWrite( void* baton, const char* data, apr_size_t* len 
 
 void CEnCo::check( const bool condition, const char* funcname )
 {
-	if( !condition ) {
+    if( !condition ) {
         printf( "\nFunction: %s\n", funcname );
-		*( int* )nullptr = 0;
-	}
+        *( int* )nullptr = 0;
+    }
 }
 
 void CEnCo::BeginWrite()
 {
-	check( isEmpty, __FUNCTION__ );
-	inputOffset = 0;
-	isEmpty = false;
+    check( isEmpty, __FUNCTION__ );
+    inputOffset = 0;
+    isEmpty = false;
 }
 
 void CEnCo::WritePart( const char* const data, const size_t length )
 {
-	check( !isEmpty, __FUNCTION__ );
-	check( length > 0 && inputOffset + length < InputBufferSize, __FUNCTION__ );
+    check( !isEmpty, __FUNCTION__ );
+    check( length > 0 && inputOffset + length < InputBufferSize, __FUNCTION__ );
 
-	memcpy( inputBuffer + inputOffset, data, length );
+    memcpy( inputBuffer + inputOffset, data, length );
     inputOffset += length;
-}
-
-bool CEnCo::isValidUtf8( const char* const buffer, const size_t size )
-{
-	size_t rest = 0;
-	for( size_t i = 0; i < size; i++ ) {
-		if( ( static_cast<unsigned char>( buffer[i] ) & 0xC0 ) != 0x80 ) {
-			if( rest > 0 ) {
-				return false;
-			}
-			for( unsigned char c = buffer[i]; ( c & 0x80 ) == 0x80; c <<= 1 ) {
-				rest++;
-			}
-			if( rest > 6 ) { // max number of bytes in UTF-8 symbol
-				return false;
-			}
-			check( rest != 1 );
-			if( rest > 0 ) {
-				rest--;
-			}
-		} else {
-			if( rest > 0 ) {
-				rest--;
-			} else {
-				return false;
-			}
-		}
-	}
-    return true;
 }
 
 void CEnCo::EndWrite( const char*& buffer, size_t& size )
@@ -221,8 +333,8 @@ void CEnCo::EndWrite( const char*& buffer, size_t& size )
     buffer = nullptr;
     size = 0;
 
-	check( !isEmpty, __FUNCTION__ );
-	isEmpty = true;
+    check( !isEmpty, __FUNCTION__ );
+    isEmpty = true;
 
     /*{
         printf( "\n%lu\n", inputOffset );
@@ -231,53 +343,41 @@ void CEnCo::EndWrite( const char*& buffer, size_t& size )
             file.write( inputBuffer, inputOffset );
        }
     }*/
-	EncaEncoding encoding = enca_analyse_const( encaAnalyzer, reinterpret_cast<const unsigned char*>( inputBuffer ), inputOffset );
-    const char* charset = enca_charset_name( encoding.charset, ENCA_NAME_STYLE_ICONV );
-    if( charset == nullptr || strcmp( charset, "???" ) == 0 ) {
-        if( isValidUtf8( inputBuffer, inputOffset ) ) {
-            charset = "UTF-8";
-        } else {
-            charset = "CP1251";
-        }
-        printf( "charset[ ??? === %s ]\n", charset );
-    }
 
-	if( strcmp( charset, "UTF-8" ) != 0 ) {
-        if( strncmp( charset, "UTF", 3 ) != 0 ) {
-            if( strncmp( charset, "UCS", 3 ) == 0 ) {
-                printf( "charset[ %s === UTF-16 ]\n", charset );
-                charset = "UTF-16";
-            } else {
-                printf( "charset[ %s === CP1251 ]\n", charset );
-                charset = "CP1251";
+    const Encoding encoding = DetectEncoding( inputBuffer, static_cast<int>( inputOffset ) );
+
+    switch( encoding ) {
+        case E_UTF8BOM:
+            buffer = inputBuffer;
+            size = inputOffset;
+            break;
+        case E_UTF8:
+            memcpy( outputBuffer + Utf8BomSize, inputBuffer, inputOffset );
+            buffer = outputBuffer;
+            size = inputOffset + Utf8BomSize;
+            break;
+        default:
+        {
+            const char* const en = encodingName( encoding );
+            printf( "encoding: %s\n", en );
+
+            auto pair = converters.insert( make_pair( en, (iconv_t)nullptr ) );
+            if( pair.second ) {
+                pair.first->second = iconv_open( "UTF-8", en );
             }
-        } else {
-            printf( "charset[ %s ]\n", charset );
+            check( pair.first->second != nullptr, __FUNCTION__ );
+
+            char* input = inputBuffer;
+            char* output = outputBuffer + Utf8BomSize;
+            size_t inputSize = inputOffset;
+            size_t outputSize = OutputBufferSize - Utf8BomSize;
+            size_t result = iconv( pair.first->second, &input, &inputSize, &output, &outputSize );
+
+            check( result != (size_t)-1, "iconv" );
+            buffer = outputBuffer;
+            size = output - outputBuffer;
         }
-
-		auto pair = converters.insert( make_pair( charset, (iconv_t)nullptr ) );
-		if( pair.second ) {
-			pair.first->second = iconv_open( "UTF-8", charset );
-		}
-        check( pair.first->second != nullptr, __FUNCTION__ );
-
-		char* input = inputBuffer;
-		char* output = outputBuffer + Utf8BomSize;
-		size_t inputSize = inputOffset;
-		size_t outputSize = OutputBufferSize - Utf8BomSize;
-		size_t result = iconv( pair.first->second, &input, &inputSize, &output, &outputSize );
-
-        check( result != (size_t)-1, "iconv" );
-        buffer = outputBuffer;
-        size = output - outputBuffer;
-	} else if( strncmp( inputBuffer, Utf8Bom, Utf8BomSize ) != 0 ) {
-        memcpy( outputBuffer + Utf8BomSize, inputBuffer, inputOffset );
-        buffer = outputBuffer;
-        size = inputOffset + Utf8BomSize;
-    } else {
-        buffer = inputBuffer;
-        size = inputOffset;
-	}
+    }
 
     normalizeLineEndings( const_cast<char*>( buffer ), size );
 }
@@ -326,6 +426,32 @@ void CEnCo::normalizeLineEndings( char* buffer, size_t& size )
     check( i > 0, __FUNCTION__ );
 }
 
+const char* CEnCo::encodingName( const Encoding encoding )
+{
+    switch( encoding ) {
+        case E_BINARY:
+            check( false, "CEnCo::encodingName BINARY" );
+            return nullptr;
+        case E_ASCII:
+            return "CP1251";
+        case E_UTF8:
+        case E_UTF8BOM:
+            return "UTF8";
+        case E_UTF16_LE:
+        case E_UTF16_LEBOM:
+            return "UTF-16LE";
+        case E_UTF16_BE:
+        case E_UTF16_BEBOM:
+            return "UTF-16BE";
+        case E_UTF32_LE:
+            return "UTF-32LE";
+        case E_UTF32_BE:
+            return "UTF-32BE";
+    }
+    check( false, "CEnCo::encodingName bad encoding" );
+    return nullptr;
+}
+
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -341,13 +467,13 @@ class AprAutoPool
     AprAutoPool &operator=(const AprAutoPool &);
 public:
     inline AprAutoPool(apr_pool_t *parent = NULL)
-        {
-		pool = svn_pool_create(parent);
-	}
-	inline ~AprAutoPool()
-        {
-		svn_pool_destroy(pool);
-	}
+    {
+        pool = svn_pool_create(parent);
+    }
+    inline ~AprAutoPool()
+    {
+        svn_pool_destroy(pool);
+    }
 
     inline void clear() { svn_pool_clear(pool); }
     inline apr_pool_t *data() const { return pool; }
