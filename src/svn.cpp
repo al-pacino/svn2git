@@ -44,10 +44,21 @@
 #include <svn_types.h>
 #include <svn_version.h>
 
+#include <QSet>
 #include <QFile>
 #include <QDebug>
+#include <QFileInfo>
 
 #include "repository.h"
+
+#include <enca.h>
+#include <iconv.h>
+#include <string>
+#include <unordered_map>
+
+using std::unordered_map;
+using std::string;
+using std::make_pair;
 
 #undef SVN_ERR
 #define SVN_ERR(expr) SVN_INT_ERR(expr)
@@ -55,6 +66,269 @@
 #if SVN_VER_MAJOR == 1 && SVN_VER_MINOR < 9
 #define svn_stream_read_full svn_stream_read
 #endif
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace {
+
+class CEnCo {
+	CEnCo( CEnCo&& ) = delete;
+	CEnCo( const CEnCo& ) = delete;
+
+public:
+    static const size_t Chunk = 8 * 1024;
+
+	static CEnCo& Instance()
+	{
+		if( instance == nullptr ) {
+			instance = new CEnCo();
+		}
+		return *instance;
+	}
+
+    static svn_error_t* DeviceWrite( void* baton, const char* data, apr_size_t* len );
+
+	void BeginWrite();
+	void WritePart( const char* const data, const size_t length );
+    void EndWrite( const char*& buffer, size_t& size );
+
+private:
+	static CEnCo* instance;
+
+    static const char Utf8Bom[];
+    static const size_t Utf8BomSize;
+	static const size_t InputBufferSize = 32 * 1024 * 1024;
+	static const size_t OutputBufferSize = 64 * 1024 * 1024;
+
+	char* inputBuffer;
+	char* outputBuffer;
+	size_t inputOffset;
+	bool isEmpty;
+
+	EncaAnalyser encaAnalyzer;
+	unordered_map<string, iconv_t> converters;
+
+	CEnCo();
+	~CEnCo();
+	static void check( const bool condition, const char* funcname = "" );
+    static void normalizeLineEndings( char* buffer, size_t& size );
+    static bool isValidUtf8( const char* const buffer, const size_t size );
+};
+
+CEnCo* CEnCo::instance = nullptr;
+const char CEnCo::Utf8Bom[] = { '\xEF', '\xBB', '\xBF' };
+const size_t CEnCo::Utf8BomSize = sizeof( CEnCo::Utf8Bom );
+
+CEnCo::CEnCo() :
+	inputOffset( 0 ),
+	isEmpty( true ),
+	encaAnalyzer( nullptr )
+{
+	inputBuffer = static_cast<char*>( ::operator new( InputBufferSize * sizeof( char ) ) );
+	check( inputBuffer != nullptr, __FUNCTION__ );
+	outputBuffer = static_cast<char*>( ::operator new( OutputBufferSize * sizeof( char ) ) );
+	check( outputBuffer != nullptr, __FUNCTION__ );
+
+    // UTF-8 BOM
+    memcpy( outputBuffer, Utf8Bom, Utf8BomSize );
+
+	encaAnalyzer = enca_analyser_alloc( "ru" );
+	check( encaAnalyzer != nullptr, __FUNCTION__ );
+    //enca_set_ambiguity( encaAnalyzer, 0 );
+    //enca_set_filtering( encaAnalyzer, 0 );
+    //enca_set_garbage_test( encaAnalyzer, 0 );
+    //enca_set_significant( encaAnalyzer, 5 );
+    //enca_set_threshold( encaAnalyzer, 1.001 );
+}
+
+CEnCo::~CEnCo()
+{
+	::operator delete( inputBuffer );
+	::operator delete( outputBuffer );
+
+	if( encaAnalyzer != nullptr ) {
+		enca_analyser_free( encaAnalyzer );
+	}
+
+	for( auto converter : converters ) {
+		iconv_close( converter.second );
+	}
+}
+
+svn_error_t* CEnCo::DeviceWrite( void* baton, const char* data, apr_size_t* len )
+{
+    CEnCo& enco = Instance();
+    check( &enco == baton, __FUNCTION__ );
+    enco.WritePart( data, *len );
+    return SVN_NO_ERROR;
+}
+
+void CEnCo::check( const bool condition, const char* funcname )
+{
+	if( !condition ) {
+        printf( "\nFunction: %s\n", funcname );
+		*( int* )nullptr = 0;
+	}
+}
+
+void CEnCo::BeginWrite()
+{
+	check( isEmpty, __FUNCTION__ );
+	inputOffset = 0;
+	isEmpty = false;
+}
+
+void CEnCo::WritePart( const char* const data, const size_t length )
+{
+	check( !isEmpty, __FUNCTION__ );
+	check( length > 0 && inputOffset + length < InputBufferSize, __FUNCTION__ );
+
+	memcpy( inputBuffer + inputOffset, data, length );
+    inputOffset += length;
+}
+
+bool CEnCo::isValidUtf8( const char* const buffer, const size_t size )
+{
+	size_t rest = 0;
+	for( size_t i = 0; i < size; i++ ) {
+		if( ( static_cast<unsigned char>( buffer[i] ) & 0xC0 ) != 0x80 ) {
+			if( rest > 0 ) {
+				return false;
+			}
+			for( unsigned char c = buffer[i]; ( c & 0x80 ) == 0x80; c <<= 1 ) {
+				rest++;
+			}
+			if( rest > 6 ) { // max number of bytes in UTF-8 symbol
+				return false;
+			}
+			check( rest != 1 );
+			if( rest > 0 ) {
+				rest--;
+			}
+		} else {
+			if( rest > 0 ) {
+				rest--;
+			} else {
+				return false;
+			}
+		}
+	}
+    return true;
+}
+
+void CEnCo::EndWrite( const char*& buffer, size_t& size )
+{
+    buffer = nullptr;
+    size = 0;
+
+	check( !isEmpty, __FUNCTION__ );
+	isEmpty = true;
+
+    /*{
+        printf( "\n%lu\n", inputOffset );
+        QFile file( "/home/anton/shared/svn2git/failed.js" );
+        if( file.open( QIODevice::WriteOnly ) ) {
+            file.write( inputBuffer, inputOffset );
+       }
+    }*/
+	EncaEncoding encoding = enca_analyse_const( encaAnalyzer, reinterpret_cast<const unsigned char*>( inputBuffer ), inputOffset );
+    const char* charset = enca_charset_name( encoding.charset, ENCA_NAME_STYLE_ICONV );
+    if( charset == nullptr || strcmp( charset, "???" ) == 0 ) {
+        if( isValidUtf8( inputBuffer, inputOffset ) ) {
+            charset = "UTF-8";
+        } else {
+            charset = "CP1251";
+        }
+        printf( "charset[ ??? === %s ]\n", charset );
+    }
+
+	if( strcmp( charset, "UTF-8" ) != 0 ) {
+        if( strncmp( charset, "UTF", 3 ) != 0 ) {
+            if( strncmp( charset, "UCS", 3 ) == 0 ) {
+                printf( "charset[ %s === UTF-16 ]\n", charset );
+                charset = "UTF-16";
+            } else {
+                printf( "charset[ %s === CP1251 ]\n", charset );
+                charset = "CP1251";
+            }
+        } else {
+            printf( "charset[ %s ]\n", charset );
+        }
+
+		auto pair = converters.insert( make_pair( charset, (iconv_t)nullptr ) );
+		if( pair.second ) {
+			pair.first->second = iconv_open( "UTF-8", charset );
+		}
+        check( pair.first->second != nullptr, __FUNCTION__ );
+
+		char* input = inputBuffer;
+		char* output = outputBuffer + Utf8BomSize;
+		size_t inputSize = inputOffset;
+		size_t outputSize = OutputBufferSize - Utf8BomSize;
+		size_t result = iconv( pair.first->second, &input, &inputSize, &output, &outputSize );
+
+        check( result != (size_t)-1, "iconv" );
+        buffer = outputBuffer;
+        size = output - outputBuffer;
+	} else if( strncmp( inputBuffer, Utf8Bom, Utf8BomSize ) != 0 ) {
+        memcpy( outputBuffer + Utf8BomSize, inputBuffer, inputOffset );
+        buffer = outputBuffer;
+        size = inputOffset + Utf8BomSize;
+    } else {
+        buffer = inputBuffer;
+        size = inputOffset;
+	}
+
+    normalizeLineEndings( const_cast<char*>( buffer ), size );
+}
+
+void CEnCo::normalizeLineEndings( char* buffer, size_t& size )
+{
+    size_t shift = 0;
+    for( size_t i = 0; i < size; i++ ) {
+        const char c = buffer[i];
+        if( c == '\r' ) {
+            if( buffer[i + 1] == '\n' ) {
+                i++;
+            } else {
+                shift++;
+            }
+        } else if( c == '\n' ) {
+            shift++;
+        }
+    }
+
+    if( shift == 0 ) {
+        return;
+    }
+
+    size += shift;
+    size_t i = size;
+    while( shift > 0 ) {
+        i--;
+        const char c = buffer[i];
+        if( c == '\n' ) {
+            buffer[i + shift] = '\n';
+            buffer[i + shift - 1] = '\r';
+            if( buffer[i - 1] == '\r' ) {
+                i--;
+            } else {
+                shift--;
+            }
+        } else if( c == '\r' ) {
+            buffer[i + shift] = '\n';
+            shift--;
+            buffer[i + shift] = '\r';
+        } else {
+            buffer[i + shift] = c;
+        }
+    }
+    check( i > 0, __FUNCTION__ );
+}
+
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 typedef QList<Rules::Match> MatchRuleList;
 typedef QHash<QString, Repository *> RepositoryHash;
@@ -250,6 +524,31 @@ static svn_stream_t *streamForDevice(QIODevice *device, apr_pool_t *pool)
     return stream;
 }
 
+static bool isConversionToUtf8Needed( const QString& name )
+{
+    static QSet<QString> extensions;
+
+    if( extensions.empty() ) {
+        extensions.insert( "ps1" );
+        extensions.insert( "psm1" );
+        extensions.insert( "cpp" );
+        extensions.insert( "h" );
+        extensions.insert( "c" );
+        extensions.insert( "inl" );
+        extensions.insert( "cs" );
+        extensions.insert( "js" );
+        extensions.insert( "bld" );
+        extensions.insert( "foss" );
+        extensions.insert( "msg" );
+        extensions.insert( "rc" );
+        extensions.insert( "sql" );
+        extensions.insert( "cc" );
+        extensions.insert( "txt" );
+    }
+
+    return extensions.contains( QFileInfo( name ).suffix() );
+}
+
 static int dumpBlob(Repository::Transaction *txn, svn_fs_root_t *fs_root,
                     const char *pathname, const QString &finalPathName, apr_pool_t *pool)
 {
@@ -289,15 +588,40 @@ static int dumpBlob(Repository::Transaction *txn, svn_fs_root_t *fs_root,
         }
     }
 
-    QIODevice *io = txn->addFile(finalPathName, mode, stream_length);
-
     if (!CommandLineParser::instance()->contains("dry-run")) {
-        // open a generic svn_stream_t for the QIODevice
-        out_stream = streamForDevice(io, dumppool);
-        SVN_ERR(svn_stream_copy3(in_stream, out_stream, NULL, NULL, dumppool));
+        QIODevice* io = nullptr;
+
+        if( isConversionToUtf8Needed( finalPathName ) ) {
+            printf( "\nconvert: [%s]\n", finalPathName.toStdString().c_str() );
+
+            CEnCo& enco = CEnCo::Instance();
+            enco.BeginWrite();
+            svn_stream_t* out_stream = svn_stream_create( &enco, pool );
+            svn_stream_set_write( out_stream, CEnCo::DeviceWrite );
+            SVN_ERR( svn_stream_copy3( in_stream, out_stream, NULL, NULL, dumppool ) );
+            const char* buffer = nullptr;
+            size_t size = 0;
+            enco.EndWrite( buffer, size );
+            /*{
+                QFile file( "/home/anton/shared/svn2git/bad.js" );
+                if( file.open( QIODevice::ReadWrite ) ) {
+                    file.write( buffer, size );
+                }
+            }*/
+            apr_size_t len = size;
+            io = txn->addFile(finalPathName, mode, size);
+            SVN_ERR( QIODevice_write( io, buffer, &len ) );
+        } else {
+            io = txn->addFile(finalPathName, mode, stream_length);
+            // open a generic svn_stream_t for the QIODevice
+            out_stream = streamForDevice(io, dumppool);
+            SVN_ERR(svn_stream_copy3(in_stream, out_stream, NULL, NULL, dumppool));
+        }
 
         // print an ending newline
         io->putChar('\n');
+    } else {
+        txn->addFile(finalPathName, mode, stream_length);
     }
 
     return EXIT_SUCCESS;
@@ -573,9 +897,9 @@ int SvnRevision::fetchRevProps()
     epoch = svndate ? get_epoch(svndate->data) : 0;
     if (authorident.isEmpty()) {
         authorident = "unknown <unknown@unknown>";
-        if( svnauthor && !svn_string_isempty( svnauthor ) ) {
+        /*if( svnauthor && !svn_string_isempty( svnauthor ) ) {
             printf( "author '%s' was not found in identity map.\n", svnauthor->data );
-        }
+        }*/
     }
     propsFetched = true;
     return EXIT_SUCCESS;
