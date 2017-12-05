@@ -380,6 +380,9 @@ void CEnCo::EndWrite( const char*& buffer, size_t& size )
     }
 
     normalizeLineEndings( const_cast<char*>( buffer ), size );
+    // without BOM
+    buffer += Utf8BomSize;
+    size -= Utf8BomSize;
 }
 
 void CEnCo::normalizeLineEndings( char* buffer, size_t& size )
@@ -402,8 +405,9 @@ void CEnCo::normalizeLineEndings( char* buffer, size_t& size )
         return;
     }
 
-    size += shift;
     size_t i = size;
+    size += shift;
+
     while( shift > 0 ) {
         i--;
         const char c = buffer[i];
@@ -666,7 +670,7 @@ static bool isConversionToUtf8Needed( const QString& name )
         extensions.insert( "bld" );
         extensions.insert( "foss" );
         extensions.insert( "msg" );
-        extensions.insert( "rc" );
+        //extensions.insert( "rc" );
         extensions.insert( "sql" );
         extensions.insert( "cc" );
         extensions.insert( "txt" );
@@ -728,12 +732,6 @@ static int dumpBlob(Repository::Transaction *txn, svn_fs_root_t *fs_root,
             const char* buffer = nullptr;
             size_t size = 0;
             enco.EndWrite( buffer, size );
-            /*{
-                QFile file( "/home/anton/shared/svn2git/bad.js" );
-                if( file.open( QIODevice::ReadWrite ) ) {
-                    file.write( buffer, size );
-                }
-            }*/
             apr_size_t len = size;
             io = txn->addFile(finalPathName, mode, size);
             SVN_ERR( QIODevice_write( io, buffer, &len ) );

@@ -490,7 +490,7 @@ void FastImportRepository::reloadBranches()
         if (br.marks.isEmpty() || !br.marks.last())
             continue;
 
-	reset_notes = true;
+    reset_notes = true;
 
         QByteArray branchRef = branch.toUtf8();
         if (!branchRef.startsWith("refs/"))
@@ -502,10 +502,10 @@ void FastImportRepository::reloadBranches()
     }
 
     if (reset_notes &&
-	CommandLineParser::instance()->contains("add-metadata-notes")) {
+    CommandLineParser::instance()->contains("add-metadata-notes")) {
       fastImport.write("reset refs/notes/commits\nfrom :" +
-		       QByteArray::number(maxMark + 1) +
-		       "\n");
+               QByteArray::number(maxMark + 1) +
+               "\n");
     }
 }
 
@@ -744,18 +744,18 @@ FastImportRepository::msgFilter(QByteArray msg)
     QByteArray output = msg;
 
     if (CommandLineParser::instance()->contains("msg-filter")) {
-	if (filterMsg.state() == QProcess::Running)
-	    qFatal("filter process already running?");
+    if (filterMsg.state() == QProcess::Running)
+        qFatal("filter process already running?");
 
-	filterMsg.start(CommandLineParser::instance()->optionArgument("msg-filter"));
+    filterMsg.start(CommandLineParser::instance()->optionArgument("msg-filter"));
 
-	if(!(filterMsg.waitForStarted(-1)))
-	    qFatal("Failed to Start Filter %d %s", __LINE__, qPrintable(filterMsg.errorString()));
+    if(!(filterMsg.waitForStarted(-1)))
+        qFatal("Failed to Start Filter %d %s", __LINE__, qPrintable(filterMsg.errorString()));
 
-	filterMsg.write(msg);
-	filterMsg.closeWriteChannel();
-	filterMsg.waitForFinished();
-	output = filterMsg.readAllStandardOutput();
+    filterMsg.write(msg);
+    filterMsg.closeWriteChannel();
+    filterMsg.waitForFinished();
+    output = filterMsg.readAllStandardOutput();
     }
     return output;
 }
