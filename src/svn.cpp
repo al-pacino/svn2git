@@ -670,13 +670,18 @@ static bool isConversionToUtf8Needed( const QString& name )
         extensions.insert( "bld" );
         extensions.insert( "foss" );
         extensions.insert( "msg" );
-        //extensions.insert( "rc" );
         extensions.insert( "sql" );
         extensions.insert( "cc" );
         extensions.insert( "txt" );
+        extensions.insert( "mak" );
+        extensions.insert( "idl" );
+        extensions.insert( "def" );
+        extensions.insert( "vbs" );
+        extensions.insert( "py" );
+        extensions.insert( "css" );
     }
 
-    return extensions.contains( QFileInfo( name ).suffix() );
+    return extensions.contains( QFileInfo( name ).suffix().toLower() );
 }
 
 static int dumpBlob(Repository::Transaction *txn, svn_fs_root_t *fs_root,
