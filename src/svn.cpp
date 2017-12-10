@@ -245,7 +245,7 @@ public:
 
     void BeginWrite();
     void WritePart( const char* const data, const size_t length );
-    void EndWrite( const char*& buffer, size_t& size );
+    void EndWrite( const char*& buffer, size_t& size, const bool withBOM );
 
 private:
     static CEnCo* instance;
@@ -328,7 +328,7 @@ void CEnCo::WritePart( const char* const data, const size_t length )
     inputOffset += length;
 }
 
-void CEnCo::EndWrite( const char*& buffer, size_t& size )
+void CEnCo::EndWrite( const char*& buffer, size_t& size, const bool withBOM )
 {
     buffer = nullptr;
     size = 0;
@@ -348,13 +348,23 @@ void CEnCo::EndWrite( const char*& buffer, size_t& size )
 
     switch( encoding ) {
         case E_UTF8BOM:
-            buffer = inputBuffer;
-            size = inputOffset;
+            if( withBOM ) {
+                buffer = inputBuffer;
+                size = inputOffset;
+            } else {
+                buffer = inputBuffer + Utf8BomSize;
+                size = inputOffset - Utf8BomSize;
+            }
             break;
         case E_UTF8:
-            memcpy( outputBuffer + Utf8BomSize, inputBuffer, inputOffset );
-            buffer = outputBuffer;
-            size = inputOffset + Utf8BomSize;
+            if( withBOM ) {
+                memcpy( outputBuffer + Utf8BomSize, inputBuffer, inputOffset );
+                buffer = outputBuffer;
+                size = inputOffset + Utf8BomSize;
+            } else {
+                buffer = inputBuffer;
+                size = inputOffset;
+            }
             break;
         default:
         {
@@ -374,15 +384,24 @@ void CEnCo::EndWrite( const char*& buffer, size_t& size )
             size_t result = iconv( pair.first->second, &input, &inputSize, &output, &outputSize );
 
             check( result != (size_t)-1, "iconv" );
+
             buffer = outputBuffer;
             size = output - outputBuffer;
+
+            // ignore iconv BOM
+            if( size >= 6 && memcmp( buffer + Utf8BomSize, Utf8Bom, Utf8BomSize ) == 0 ) {
+                buffer += Utf8BomSize;
+                size -= Utf8BomSize;
+            }
+
+            if( !withBOM ) {
+                buffer += Utf8BomSize;
+                size -= Utf8BomSize;
+            }
         }
     }
 
     normalizeLineEndings( const_cast<char*>( buffer ), size );
-    // without BOM
-    buffer += Utf8BomSize;
-    size -= Utf8BomSize;
 }
 
 void CEnCo::normalizeLineEndings( char* buffer, size_t& size )
@@ -654,34 +673,39 @@ static svn_stream_t *streamForDevice(QIODevice *device, apr_pool_t *pool)
     return stream;
 }
 
-static bool isConversionToUtf8Needed( const QString& name )
+static bool isConversionToUtf8Needed( const QString& name, bool& withBOM )
 {
-    static QSet<QString> extensions;
+    static QMap<QString, bool> extensions;
 
     if( extensions.empty() ) {
-        extensions.insert( "ps1" );
-        extensions.insert( "psm1" );
-        extensions.insert( "cpp" );
-        extensions.insert( "h" );
-        extensions.insert( "c" );
-        extensions.insert( "inl" );
-        extensions.insert( "cs" );
-        extensions.insert( "js" );
-        extensions.insert( "bld" );
-        extensions.insert( "foss" );
-        extensions.insert( "msg" );
-        extensions.insert( "sql" );
-        extensions.insert( "cc" );
-        extensions.insert( "txt" );
-        extensions.insert( "mak" );
-        extensions.insert( "idl" );
-        extensions.insert( "def" );
-        extensions.insert( "vbs" );
-        extensions.insert( "py" );
-        extensions.insert( "css" );
+        extensions.insert( "ps1",  false );
+        extensions.insert( "psm1", false );
+        extensions.insert( "cpp",  false );
+        extensions.insert( "h",    false );
+        extensions.insert( "c",    false );
+        extensions.insert( "inl",  false );
+        extensions.insert( "cs",   false );
+        extensions.insert( "js",   false );
+        extensions.insert( "bld",  false );
+        extensions.insert( "foss", false );
+        extensions.insert( "msg",  true );
+        extensions.insert( "sql",  true );
+        extensions.insert( "cc",   false );
+        extensions.insert( "txt",  false );
+        extensions.insert( "mak",  false );
+        extensions.insert( "idl",  false );
+        extensions.insert( "def",  false );
+        extensions.insert( "vbs",  false );
+        extensions.insert( "py",   false );
+        extensions.insert( "css",  false );
     }
 
-    return extensions.contains( QFileInfo( name ).suffix().toLower() );
+    auto i = extensions.find( QFileInfo( name ).suffix().toLower() );
+    if( i != extensions.end() ) {
+        withBOM = i.value();
+        return true;
+    }
+    return false;
 }
 
 static int dumpBlob(Repository::Transaction *txn, svn_fs_root_t *fs_root,
@@ -726,7 +750,8 @@ static int dumpBlob(Repository::Transaction *txn, svn_fs_root_t *fs_root,
     if (!CommandLineParser::instance()->contains("dry-run")) {
         QIODevice* io = nullptr;
 
-        if( isConversionToUtf8Needed( finalPathName ) ) {
+        bool withBOM = false;
+        if( isConversionToUtf8Needed( finalPathName, withBOM ) ) {
             printf( "\nconvert: [%s]\n", finalPathName.toStdString().c_str() );
 
             CEnCo& enco = CEnCo::Instance();
@@ -736,7 +761,7 @@ static int dumpBlob(Repository::Transaction *txn, svn_fs_root_t *fs_root,
             SVN_ERR( svn_stream_copy3( in_stream, out_stream, NULL, NULL, dumppool ) );
             const char* buffer = nullptr;
             size_t size = 0;
-            enco.EndWrite( buffer, size );
+            enco.EndWrite( buffer, size, withBOM );
             apr_size_t len = size;
             io = txn->addFile(finalPathName, mode, size);
             SVN_ERR( QIODevice_write( io, buffer, &len ) );
