@@ -992,7 +992,7 @@ void FastImportRepository::Transaction::commit()
     s.append("committer " + author + " " + QString::number(datetime).toUtf8() + " +0000" + "\n");
     s.append("data " + QString::number(message.length()) + "\n");
     s.append(message + "\n");
-    s.append("from :" + QByteArray::number(mark - 1) + "\n");
+    s.append("from :" + QByteArray::number(mark - 1) + "\n"); // enable to inc
     repository->fastImport.write(s);
 
     // note some of the inferred merges
